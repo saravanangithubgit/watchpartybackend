@@ -115,7 +115,7 @@ function closeRoomAfterHostGracePeriod(socketId, roomId) {
     delete roomMemory[roomId];
     delete roomUsers[roomId];
     delete hostDisconnectTimers[roomId];
-  }, 30000);
+  }, 5 * 60 * 1000);
 }
 
 io.on('connection', (socket) => {
@@ -241,6 +241,9 @@ io.on('connection', (socket) => {
     if (hostBySocket[socket.id]) {
       console.log(`Host disconnected. Waiting briefly for reconnect in room ${roomId}`);
       delete hostBySocket[socket.id];
+      if (hostByRoom[roomId] === socket.id) {
+        delete hostByRoom[roomId];
+      }
       removeUserFromRoom(socket, roomId);
       closeRoomAfterHostGracePeriod(socket.id, roomId);
       return;
