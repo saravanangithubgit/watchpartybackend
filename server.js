@@ -29,6 +29,7 @@ const roomMemory = {};
 const roomUsers = {};
 const hostBySocket = {};
 const hostByRoom = {};
+const hostDisconnectTimers = {};
 
 function normalizeRoomId(roomIdRaw) {
   return String(roomIdRaw || '').trim().toUpperCase();
@@ -79,6 +80,33 @@ function removeUserFromRoom(socket, roomId) {
   }
 }
 
+function clearHostDisconnectTimer(roomId) {
+  if (!hostDisconnectTimers[roomId]) return;
+  clearTimeout(hostDisconnectTimers[roomId]);
+  delete hostDisconnectTimers[roomId];
+}
+
+function closeRoomAfterHostGracePeriod(socketId, roomId) {
+  clearHostDisconnectTimer(roomId);
+  hostDisconnectTimers[roomId] = setTimeout(() => {
+    if (hostByRoom[roomId] && hostByRoom[roomId] !== socketId) {
+      delete hostDisconnectTimers[roomId];
+      return;
+    }
+
+    console.log(`Host did not reconnect. Closing room ${roomId}`);
+    db.collection('rooms').doc(roomId).delete().catch((error) => {
+      console.error('Error deleting ghost room:', error);
+    });
+    io.to(roomId).emit('room-closed');
+    delete hostBySocket[socketId];
+    delete hostByRoom[roomId];
+    delete roomMemory[roomId];
+    delete roomUsers[roomId];
+    delete hostDisconnectTimers[roomId];
+  }, 30000);
+}
+
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
@@ -95,10 +123,18 @@ io.on('connection', (socket) => {
     socket.data.isHost = isHost;
 
     if (!roomUsers[roomId]) roomUsers[roomId] = [];
-    roomUsers[roomId] = roomUsers[roomId].filter((user) => user.id !== socket.id);
+    roomUsers[roomId] = roomUsers[roomId].filter((user) => {
+      if (user.id === socket.id) return false;
+      if (isHost && user.isHost) return false;
+      return true;
+    });
     roomUsers[roomId].push({ id: socket.id, name: userName, isHost });
 
     if (isHost) {
+      clearHostDisconnectTimer(roomId);
+      Object.keys(hostBySocket).forEach((hostSocketId) => {
+        if (hostBySocket[hostSocketId] === roomId) delete hostBySocket[hostSocketId];
+      });
       hostBySocket[socket.id] = roomId;
       hostByRoom[roomId] = socket.id;
     }
@@ -165,10 +201,12 @@ io.on('connection', (socket) => {
     const roomId = normalizeRoomId(roomIdRaw || socket.data.roomId);
     if (!roomId) return;
 
+    clearHostDisconnectTimer(roomId);
     socket.to(roomId).emit('room-closed');
     delete roomMemory[roomId];
     delete roomUsers[roomId];
     delete hostByRoom[roomId];
+    delete hostBySocket[socket.id];
   });
 
   socket.on('chat-message', (data = {}) => {
@@ -188,15 +226,10 @@ io.on('connection', (socket) => {
     const roomId = socket.data.roomId || hostBySocket[socket.id];
 
     if (hostBySocket[socket.id]) {
-      console.log(`Host disconnected. Closing room ${roomId}`);
-      db.collection('rooms').doc(roomId).delete().catch((error) => {
-        console.error('Error deleting ghost room:', error);
-      });
-      io.to(roomId).emit('room-closed');
+      console.log(`Host disconnected. Waiting briefly for reconnect in room ${roomId}`);
       delete hostBySocket[socket.id];
-      delete hostByRoom[roomId];
-      delete roomMemory[roomId];
-      delete roomUsers[roomId];
+      removeUserFromRoom(socket, roomId);
+      closeRoomAfterHostGracePeriod(socket.id, roomId);
       return;
     }
 
