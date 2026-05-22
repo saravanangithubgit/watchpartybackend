@@ -24,7 +24,7 @@ const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   maxHttpBufferSize: 1e6,
   transports: ['websocket', 'polling'],
-  pingTimeout: 30000,
+  pingTimeout: 120000,
   pingInterval: 25000,
 });
 
@@ -234,8 +234,8 @@ io.on('connection', (socket) => {
   socket.on('webrtc-ice-candidate', (data = {}) => emitToTargetOrHost(socket, 'webrtc-ice-candidate', data));
   socket.on('end-call', (data = {}) => emitToTargetOrHost(socket, 'end-call', data));
 
-  socket.on('disconnect', () => {
-    console.log(`User disconnected: ${socket.id}`);
+  socket.on('disconnect', (reason) => {
+    console.log(`User disconnected: ${socket.id}. Reason: ${reason}`);
     const roomId = socket.data.roomId || hostBySocket[socket.id];
 
     if (hostBySocket[socket.id]) {
