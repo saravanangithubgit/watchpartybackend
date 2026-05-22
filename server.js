@@ -23,6 +23,9 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   maxHttpBufferSize: 1e6,
+  transports: ['websocket', 'polling'],
+  pingTimeout: 30000,
+  pingInterval: 25000,
 });
 
 const roomMemory = {};
@@ -30,6 +33,14 @@ const roomUsers = {};
 const hostBySocket = {};
 const hostByRoom = {};
 const hostDisconnectTimers = {};
+
+io.engine.on('connection_error', (error) => {
+  console.error('Socket engine connection error:', {
+    code: error.code,
+    message: error.message,
+    context: error.context,
+  });
+});
 
 function normalizeRoomId(roomIdRaw) {
   return String(roomIdRaw || '').trim().toUpperCase();
@@ -116,6 +127,8 @@ io.on('connection', (socket) => {
     const isHost = data.isHost === true;
 
     if (!roomId) return;
+
+    console.log(`User ${socket.id} joining room ${roomId} as ${isHost ? 'host' : 'viewer'}`);
 
     socket.join(roomId);
     socket.data.roomId = roomId;
