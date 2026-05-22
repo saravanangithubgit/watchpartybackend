@@ -30,6 +30,41 @@ const roomUsers = {};
 const hostBySocket = {};
 const hostByRoom = {};
 
+function normalizeRoomId(roomIdRaw) {
+  return String(roomIdRaw || '').trim().toUpperCase();
+}
+
+function normalizeSocketId(socketIdRaw) {
+  return String(socketIdRaw || '').trim();
+}
+
+function getHostSocketId(roomId) {
+  const hostSocketId = hostByRoom[roomId];
+  if (hostSocketId) return hostSocketId;
+
+  const hostUser = (roomUsers[roomId] || []).find((user) => user.isHost);
+  return hostUser?.id || null;
+}
+
+function emitToTargetOrHost(socket, eventName, data = {}) {
+  const targetId = normalizeSocketId(data.targetId);
+  if (targetId) {
+    io.to(targetId).emit(eventName, data);
+    return;
+  }
+
+  const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
+  const hostSocketId = roomId ? getHostSocketId(roomId) : null;
+  if (hostSocketId) {
+    io.to(hostSocketId).emit(eventName, {
+      ...data,
+      roomId,
+      targetId: hostSocketId,
+      callerId: data.callerId || socket.id,
+    });
+  }
+}
+
 function updateUsers(roomId) {
   io.to(roomId).emit('update-users', roomUsers[roomId] || []);
 }
@@ -48,7 +83,7 @@ io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
   socket.on('join-room', (data = {}) => {
-    const roomId = String(data.roomId || '').trim().toUpperCase();
+    const roomId = normalizeRoomId(data.roomId);
     const userName = String(data.userName || 'Guest').trim() || 'Guest';
     const isHost = data.isHost === true;
 
@@ -59,16 +94,15 @@ io.on('connection', (socket) => {
     socket.data.userName = userName;
     socket.data.isHost = isHost;
 
-    if (isHost) {
-      hostBySocket[socket.id] = roomId;
-      hostByRoom[roomId] = socket.id;
-    } else if (hostByRoom[roomId]) {
-      io.to(hostByRoom[roomId]).emit('force-host-sync', { roomId, viewerId: socket.id });
-    }
-
     if (!roomUsers[roomId]) roomUsers[roomId] = [];
     roomUsers[roomId] = roomUsers[roomId].filter((user) => user.id !== socket.id);
     roomUsers[roomId].push({ id: socket.id, name: userName, isHost });
+
+    if (isHost) {
+      hostBySocket[socket.id] = roomId;
+      hostByRoom[roomId] = socket.id;
+    }
+
     updateUsers(roomId);
 
     if (roomMemory[roomId]?.sync) {
@@ -77,10 +111,17 @@ io.on('connection', (socket) => {
     if (roomMemory[roomId]?.videoId) {
       socket.emit('video-changed', roomMemory[roomId].videoId);
     }
+
+    if (!isHost) {
+      const hostSocketId = getHostSocketId(roomId);
+      if (hostSocketId) {
+        io.to(hostSocketId).emit('force-host-sync', { roomId, viewerId: socket.id });
+      }
+    }
   });
 
   socket.on('video-action', (data = {}) => {
-    const roomId = String(data.roomId || '').trim().toUpperCase();
+    const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
     if (!roomId || !data.action) return;
 
     roomMemory[roomId] = {
@@ -91,7 +132,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('change-video', (data = {}) => {
-    const roomId = String(data.roomId || '').trim().toUpperCase();
+    const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
     if (!roomId || !data.videoId) return;
 
     roomMemory[roomId] = {
@@ -100,20 +141,28 @@ io.on('connection', (socket) => {
       sync: undefined,
     };
     socket.to(roomId).emit('video-changed', data.videoId);
-    if (hostByRoom[roomId]) {
-      io.to(hostByRoom[roomId]).emit('force-host-sync', { roomId });
+    const hostSocketId = getHostSocketId(roomId);
+    if (hostSocketId) {
+      io.to(hostSocketId).emit('force-host-sync', { roomId });
     }
   });
 
   socket.on('request-host-sync', (data = {}) => {
-    const roomId = String(data.roomId || socket.data.roomId || '').trim().toUpperCase();
-    if (roomId && hostByRoom[roomId]) {
-      io.to(hostByRoom[roomId]).emit('force-host-sync', { roomId, viewerId: socket.id });
+    const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
+    if (!roomId) return;
+
+    if (roomMemory[roomId]?.sync) {
+      socket.emit('sync-action', roomMemory[roomId].sync);
+    }
+
+    const hostSocketId = getHostSocketId(roomId);
+    if (hostSocketId) {
+      io.to(hostSocketId).emit('force-host-sync', { roomId, viewerId: socket.id });
     }
   });
 
   socket.on('end-room', (roomIdRaw) => {
-    const roomId = String(roomIdRaw || '').trim().toUpperCase();
+    const roomId = normalizeRoomId(roomIdRaw || socket.data.roomId);
     if (!roomId) return;
 
     socket.to(roomId).emit('room-closed');
@@ -123,15 +172,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('chat-message', (data = {}) => {
-    if (data.roomId) io.in(String(data.roomId).trim().toUpperCase()).emit('chat-message', data);
+    const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
+    if (roomId) io.in(roomId).emit('chat-message', { ...data, roomId });
   });
 
-  socket.on('call-request', (data = {}) => io.to(data.targetId).emit('call-request', data));
-  socket.on('call-response', (data = {}) => io.to(data.targetId).emit('call-response', data));
-  socket.on('webrtc-offer', (data = {}) => io.to(data.targetId).emit('webrtc-offer', data));
-  socket.on('webrtc-answer', (data = {}) => io.to(data.targetId).emit('webrtc-answer', data));
-  socket.on('webrtc-ice-candidate', (data = {}) => io.to(data.targetId).emit('webrtc-ice-candidate', data));
-  socket.on('end-call', (data = {}) => io.to(data.targetId).emit('end-call', data));
+  socket.on('call-request', (data = {}) => emitToTargetOrHost(socket, 'call-request', data));
+  socket.on('call-response', (data = {}) => emitToTargetOrHost(socket, 'call-response', data));
+  socket.on('webrtc-offer', (data = {}) => emitToTargetOrHost(socket, 'webrtc-offer', data));
+  socket.on('webrtc-answer', (data = {}) => emitToTargetOrHost(socket, 'webrtc-answer', data));
+  socket.on('webrtc-ice-candidate', (data = {}) => emitToTargetOrHost(socket, 'webrtc-ice-candidate', data));
+  socket.on('end-call', (data = {}) => emitToTargetOrHost(socket, 'end-call', data));
 
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
