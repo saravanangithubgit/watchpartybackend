@@ -21,7 +21,9 @@ admin.initializeApp({
 const db = admin.firestore();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  // Native apps have no browser Origin header; browser origins can be locked
+  // down with CLIENT_ORIGIN in production.
+  cors: { origin: process.env.CLIENT_ORIGIN || true, methods: ['GET', 'POST'] },
   maxHttpBufferSize: 1e6,
   transports: ['websocket', 'polling'],
   pingTimeout: 120000,
@@ -50,6 +52,15 @@ function normalizeSocketId(socketIdRaw) {
   return String(socketIdRaw || '').trim();
 }
 
+function getSocketInSameRoom(socket, targetId) {
+  const target = io.sockets.sockets.get(targetId);
+  return target && target.data.roomId === socket.data.roomId ? target : null;
+}
+
+function isVerifiedHost(socket, roomId) {
+  return socket.data.isHost === true && socket.data.roomId === roomId;
+}
+
 function getHostSocketId(roomId) {
   const hostSocketId = hostByRoom[roomId];
   if (hostSocketId) return hostSocketId;
@@ -61,7 +72,10 @@ function getHostSocketId(roomId) {
 function emitToTargetOrHost(socket, eventName, data = {}) {
   const targetId = normalizeSocketId(data.targetId);
   if (targetId) {
-    io.to(targetId).emit(eventName, data);
+    // Never let a participant signal, call, or send ICE to a socket in another room.
+    if (getSocketInSameRoom(socket, targetId)) {
+      io.to(targetId).emit(eventName, { ...data, callerId: socket.id });
+    }
     return;
   }
 
@@ -72,7 +86,7 @@ function emitToTargetOrHost(socket, eventName, data = {}) {
       ...data,
       roomId,
       targetId: hostSocketId,
-      callerId: data.callerId || socket.id,
+      callerId: socket.id,
     });
   }
 }
@@ -118,15 +132,49 @@ function closeRoomAfterHostGracePeriod(socketId, roomId) {
   }, 5 * 60 * 1000);
 }
 
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token || typeof token !== 'string') {
+    return next(new Error('Authentication required'));
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    socket.data.uid = decoded.uid;
+    next();
+  } catch (error) {
+    console.warn('Rejected socket authentication:', error.code || error.message);
+    next(new Error('Invalid authentication token'));
+  }
+});
+
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  socket.on('join-room', (data = {}) => {
+  socket.on('join-room', async (data = {}) => {
     const roomId = normalizeRoomId(data.roomId);
     const userName = String(data.userName || 'Guest').trim() || 'Guest';
     const isHost = data.isHost === true;
 
     if (!roomId) return;
+
+    let room;
+    try {
+      const roomSnapshot = await db.collection('rooms').doc(roomId).get();
+      if (!roomSnapshot.exists) {
+        socket.emit('room-error', { code: 'not-found', message: 'Room no longer exists.' });
+        return;
+      }
+      room = roomSnapshot.data();
+    } catch (error) {
+      console.error('Room lookup failed:', error);
+      socket.emit('room-error', { code: 'unavailable', message: 'Could not verify room access.' });
+      return;
+    }
+
+    if (isHost && room.hostId !== socket.data.uid) {
+      socket.emit('room-error', { code: 'not-host', message: 'Only the room owner can host this room.' });
+      return;
+    }
 
     console.log(`User ${socket.id} joining room ${roomId} as ${isHost ? 'host' : 'viewer'}`);
 
@@ -171,7 +219,7 @@ io.on('connection', (socket) => {
 
   socket.on('video-action', (data = {}) => {
     const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
-    if (!roomId || !data.action) return;
+    if (!roomId || !data.action || !isVerifiedHost(socket, roomId)) return;
 
     roomMemory[roomId] = {
       ...(roomMemory[roomId] || {}),
@@ -182,7 +230,7 @@ io.on('connection', (socket) => {
 
   socket.on('change-video', (data = {}) => {
     const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
-    if (!roomId || !data.videoId) return;
+    if (!roomId || !data.videoId || !isVerifiedHost(socket, roomId)) return;
 
     roomMemory[roomId] = {
       ...(roomMemory[roomId] || {}),
@@ -212,7 +260,7 @@ io.on('connection', (socket) => {
 
   socket.on('end-room', (roomIdRaw) => {
     const roomId = normalizeRoomId(roomIdRaw || socket.data.roomId);
-    if (!roomId) return;
+    if (!roomId || !isVerifiedHost(socket, roomId)) return;
 
     clearHostDisconnectTimer(roomId);
     socket.to(roomId).emit('room-closed');
@@ -220,11 +268,24 @@ io.on('connection', (socket) => {
     delete roomUsers[roomId];
     delete hostByRoom[roomId];
     delete hostBySocket[socket.id];
+    db.collection('rooms').doc(roomId).delete().catch((error) => {
+      console.error('Error deleting ended room:', error);
+    });
   });
 
   socket.on('chat-message', (data = {}) => {
     const roomId = normalizeRoomId(data.roomId || socket.data.roomId);
-    if (roomId) io.in(roomId).emit('chat-message', { ...data, roomId });
+    if (!roomId || socket.data.roomId !== roomId) return;
+    const text = typeof data.text === 'string' ? data.text.slice(0, 12000) : '';
+    const url = typeof data.url === 'string' ? data.url.slice(0, 4000) : null;
+    const type = data.type === 'gif' ? 'gif' : 'text';
+    io.in(roomId).emit('chat-message', {
+      roomId,
+      type,
+      text,
+      url,
+      user: socket.data.userName || 'Guest',
+    });
   });
 
   socket.on('call-request', (data = {}) => emitToTargetOrHost(socket, 'call-request', data));
