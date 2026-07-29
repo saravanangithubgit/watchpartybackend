@@ -8,6 +8,29 @@ const app = express();
 app.use(cors());
 app.get('/', (_req, res) => res.send('Watch Party sync server is running'));
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+app.get('/api/gifs', async (req, res) => {
+  const query = String(req.query.q || '').trim().slice(0, 80);
+  const apiKey = process.env.GIPHY_API_KEY;
+  if (!query) return res.status(400).json({ error: 'A search query is required.' });
+  if (!apiKey) return res.status(503).json({ error: 'GIF search is not configured.' });
+
+  try {
+    const upstream = await fetch(
+      `https://api.giphy.com/v1/gifs/search?api_key=${encodeURIComponent(apiKey)}&q=${encodeURIComponent(query)}&limit=20&rating=g`,
+    );
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'GIF provider is unavailable.' });
+    }
+    const body = await upstream.json();
+    const gifs = Array.isArray(body.data)
+      ? body.data.map((gif) => gif?.images?.fixed_height?.url).filter(Boolean)
+      : [];
+    res.json({ gifs });
+  } catch (error) {
+    console.error('GIF search failed:', error);
+    res.status(502).json({ error: 'GIF provider is unavailable.' });
+  }
+});
 
 if (!process.env.FIREBASE_KEY) {
   throw new Error('Missing FIREBASE_KEY environment variable');
@@ -35,6 +58,7 @@ const roomUsers = {};
 const hostBySocket = {};
 const hostByRoom = {};
 const hostDisconnectTimers = {};
+const chatSequenceByRoom = {};
 
 io.engine.on('connection_error', (error) => {
   console.error('Socket engine connection error:', {
@@ -102,6 +126,7 @@ function removeUserFromRoom(socket, roomId) {
 
   if (roomUsers[roomId].length === 0) {
     delete roomUsers[roomId];
+    delete chatSequenceByRoom[roomId];
   }
 }
 
@@ -128,6 +153,7 @@ function closeRoomAfterHostGracePeriod(socketId, roomId) {
     delete hostByRoom[roomId];
     delete roomMemory[roomId];
     delete roomUsers[roomId];
+    delete chatSequenceByRoom[roomId];
     delete hostDisconnectTimers[roomId];
   }, 5 * 60 * 1000);
 }
@@ -279,8 +305,13 @@ io.on('connection', (socket) => {
     const text = typeof data.text === 'string' ? data.text.slice(0, 12000) : '';
     const url = typeof data.url === 'string' ? data.url.slice(0, 4000) : null;
     const type = data.type === 'gif' ? 'gif' : 'text';
+    const sequence = (chatSequenceByRoom[roomId] || 0) + 1;
+    chatSequenceByRoom[roomId] = sequence;
     io.in(roomId).emit('chat-message', {
       roomId,
+      id: `${roomId}-${sequence}`,
+      sequence,
+      sentAt: Date.now(),
       type,
       text,
       url,
