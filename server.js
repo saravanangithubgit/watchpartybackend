@@ -3,9 +3,11 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const admin = require('firebase-admin');
+const { AccessToken } = require('livekit-server-sdk');
 
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: '32kb' }));
 app.get('/', (_req, res) => res.send('Watch Party sync server is running'));
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 app.get('/api/gifs', async (req, res) => {
@@ -42,6 +44,59 @@ admin.initializeApp({
 });
 
 const db = admin.firestore();
+
+// The LiveKit SFU relays real-time media. It does not store the host's MP4.
+// Keep these credentials only in the server deployment environment.
+app.get('/api/livekit-token', async (req, res) => {
+  const roomId = normalizeRoomId(req.query.roomId);
+  const authorization = String(req.headers.authorization || '');
+  const idToken = authorization.startsWith('Bearer ')
+    ? authorization.substring('Bearer '.length)
+    : '';
+
+  if (!roomId || !idToken) {
+    return res.status(400).json({ error: 'roomId and Firebase authentication are required.' });
+  }
+  if (!process.env.LIVEKIT_URL || !process.env.LIVEKIT_API_KEY || !process.env.LIVEKIT_API_SECRET) {
+    return res.status(503).json({ error: 'Private live streaming is not configured.' });
+  }
+
+  try {
+    const [user, roomSnapshot] = await Promise.all([
+      admin.auth().verifyIdToken(idToken),
+      db.collection('rooms').doc(roomId).get(),
+    ]);
+    if (!roomSnapshot.exists) {
+      return res.status(404).json({ error: 'Room no longer exists.' });
+    }
+
+    const room = roomSnapshot.data();
+    const isHost = room.hostId === user.uid;
+    const token = new AccessToken(process.env.LIVEKIT_API_KEY, process.env.LIVEKIT_API_SECRET, {
+      identity: user.uid,
+      name: user.name || user.email || 'Watch party member',
+      ttl: '1h',
+    });
+    token.addGrant({
+      room: `watch-party-${roomId}`,
+      roomJoin: true,
+      canPublish: isHost,
+      canPublishData: isHost,
+      canSubscribe: true,
+    });
+
+    return res.json({
+      url: process.env.LIVEKIT_URL,
+      token: await token.toJwt(),
+      roomName: `watch-party-${roomId}`,
+      canPublish: isHost,
+    });
+  } catch (error) {
+    console.error('LiveKit token request failed:', error);
+    return res.status(401).json({ error: 'Invalid Firebase session.' });
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   // Native apps have no browser Origin header; browser origins can be locked
